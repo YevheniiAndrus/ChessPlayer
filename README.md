@@ -18,11 +18,14 @@ raw Lichess PGN dump
   -> build_dataset.py       (PGN -> TFRecord shards of training windows)
   -> tune.py                (Keras Tuner search for good hyperparameters)
   -> train.py                (the real, full-length training run)
+  -> predict.py              (load a trained checkpoint, predict the next move)
 ```
 
-`run_pipeline.sh` runs the last two stages (tune -> train) back to back;
-the three data-prep stages before that are one-off and only need
-rerunning if you change the source data, the ELO threshold, or `seq_len`.
+`run_pipeline.sh` runs the tune -> train stages back to back; the three
+data-prep stages before that are one-off and only need rerunning if you
+change the source data, the ELO threshold, or `seq_len`. `predict.py` is
+the standalone inference step you run afterwards, as many times as you
+like, against whatever checkpoint `train.py` last produced.
 
 ## 1. Requirements
 
@@ -189,14 +192,72 @@ Outputs, all under `checkpoints/`:
 | `used_hyperparameters.json` | The exact hyperparameters this run used -- needed to reconstruct `ChessTransformerDecoder` with matching arguments before `load_weights()` will work. |
 | `training_log.csv` | Per-epoch loss/perplexity/accuracy history. |
 
+## 6. Run inference (`predict.py`)
+
+Once you have `checkpoints/best.weights.h5` and
+`checkpoints/used_hyperparameters.json` from a training run you're happy
+with, `predict.py` loads them and predicts the next move for a given
+sequence of previous moves.
+
+```bash
+# Moves as plain text -- SAN ("Nf3", "O-O", "exd5", ...) and/or UCI
+# ("g1f3", "e1g1", "e7d5", ...) are both accepted, move-by-move,
+# auto-detected; PGN move numbers ("1.", "1...") are stripped automatically.
+python scripts/predict.py --moves "e4 e5 Nf3 Nc6 Bb5 a6"
+python scripts/predict.py --moves "1. e4 e5 2. Nf3 Nc6 3. Bb5"
+
+# Or read the mainline moves out of a PGN file instead:
+python scripts/predict.py --pgn game_in_progress.pgn
+
+# Show more/fewer candidate moves, or see the model's raw preference
+# without restricting it to legal moves:
+python scripts/predict.py --moves "e4 e5 Nf3 Nc6" --top-k 10
+python scripts/predict.py --moves "e4 e5 Nf3 Nc6" --allow-illegal
+```
+
+The input moves are replayed on a real `chess.Board()` -- the same
+handling `build_dataset.py` uses while preparing training data -- which
+both resolves SAN/UCI/castling/promotions correctly and gives us the
+current position, used to mask the model's output down to only
+currently-legal moves before picking a candidate (since move-sequence
+-only training doesn't hard-constrain the model to legal play). Pass
+`--allow-illegal` to inspect the raw, unmasked distribution instead --
+useful for sanity-checking the model itself, not for actually choosing a
+move.
+
+Since training windows were always exactly `seq_len` moves (`config.yaml`:
+`data.seq_len`, default 40) starting from position 0, the model has no
+notion of context beyond that many moves back. Past `seq_len` moves into
+a game, `predict.py` feeds it only the most recent `seq_len` moves --
+still the best available input given how it was trained, but a bit more
+of an extrapolation than early-game predictions, since the model never
+specifically saw a window positioned that way during training.
+
+Useful flags:
+
+| Flag | What it does |
+|---|---|
+| `--top-k N` (default 5) | Number of candidate next moves to show. |
+| `--allow-illegal` | Skip the legal-move mask; show the model's raw top-k over the whole vocabulary. |
+| `--checkpoint PATH` | Weights file to load. Default: `checkpoints/best.weights.h5`. |
+| `--hyperparameters PATH` | `used_hyperparameters.json` to reconstruct the model architecture from. Default: `checkpoints/used_hyperparameters.json`. |
+| `--seq-len N` | Must match the checkpoint's training `seq_len`. Default: `data.seq_len` in `config.yaml`. |
+
+Output is the top predicted move (UCI, SAN, and probability) plus a
+ranked candidate list.
+
 ## Monitoring while it runs
 
 Metrics to watch, per epoch, in `training_log.csv` (or the live progress
 bar): `val_loss` should decrease (or at least not get worse) every few
-epochs; `val_top1_acc`/`val_top5_acc` should climb. `perplexity`/
-`val_perplexity` are currently miscalibrated relative to `loss`/`val_loss`
-(a known padding-averaging quirk in the custom loss) -- trust `loss` and
-the accuracy metrics over `perplexity` for now.
+epochs; `val_top1_acc`/`val_top5_acc` should climb; `perplexity`/
+`val_perplexity` (== `exp(loss)`) should track `loss`/`val_loss` closely
+and trend down alongside it. All four metrics are computed as
+`weighted_metrics` in `model.py`'s `compile_default()`, so -- like the
+loss itself -- they correctly exclude padding positions from a game's
+final, shorter-than-`seq_len` window; if `perplexity` ever swings wildly
+epoch to epoch while `loss` stays smooth, that's a sign this masking
+regressed, not that training itself is unstable.
 
 ## Disk space
 
@@ -232,18 +293,10 @@ scripts/
   hypermodel.py             ChessHyperModel (keras_tuner.HyperModel wrapper)
   tune.py                   Keras Tuner search CLI
   train.py                  full training run CLI
+  predict.py                loads a checkpoint and predicts the next move for a given position
   check_gpu.py              verifies tensorflow-metal is actually accelerating on the GPU
 data/                      filtered PGN, vocab.json, TFRecord shards (gitignored -- regenerate, don't commit)
 checkpoints/               training outputs (weights, logs, used_hyperparameters.json)
 tuner_runs/                Keras Tuner's own search state and best_hyperparameters.json
 ```
 
-## What's not built yet
-
-An inference script that loads a trained checkpoint and actually
-generates/ranks moves for a given position isn't part of this pipeline
-yet -- `train.py` produces `checkpoints/best.weights.h5` and
-`checkpoints/used_hyperparameters.json` (everything needed to reconstruct
-the exact model and load those weights), but turning that into "give me
-the best move for this position" is the next step once a training run
-you're happy with has finished.
