@@ -1,0 +1,94 @@
+# config.yaml
+#
+# Every hyperparameter and path used across the pipeline (data prep,
+# model, training, and the Keras Tuner search), in one place instead of
+# hardcoded inside the scripts. Loaded via scripts/config.py's
+# load_config(); paths below are resolved relative to this file's own
+# directory (the project root), so scripts work the same regardless of
+# which directory they're run from.
+
+data:
+  # Minimum ELO (strictly greater than) required for BOTH players --
+  # used by filter_pgn_by_elo.py.
+  min_elo: 2000
+  # Context length: number of previous moves per training example. Must
+  # stay consistent across build_dataset.py, the model, and the tuner --
+  # changing it means rebuilding the TFRecords (build_dataset.py --seq-len).
+  seq_len: 40
+  # Source games per TFRecord shard (build_dataset.py). Shards are whole
+  # -game-aligned, which is what lets you hold out entire shard files as
+  # a leak-free validation split (see paths.val_tfrecord_pattern below).
+  games_per_shard: 20000
+
+paths:
+  filtered_pgn: "data/games_filtered.pgn"
+  vocab: "data/vocab.json"
+  tfrecords_dir: "data/tfrecords"
+  # Glob patterns used by tune.py / train.py. The held-out shard(s) at the
+  # end become validation -- see the note in build_dataset.py about why
+  # whole-shard splits don't leak games between train and validation.
+  train_tfrecord_pattern: "data/tfrecords/shard-0000[0-8]*.tfrecord"
+  val_tfrecord_pattern: "data/tfrecords/shard-00009*.tfrecord"
+  tuner_project_dir: "tuner_runs"
+  checkpoints_dir: "checkpoints"
+
+# Fixed hyperparameters for a normal (non-tuned) training run -- what
+# train.py uses when you're not running tune.py first. Also doubles as
+# the set of values held fixed (i.e. NOT searched) during tuning: things
+# like layer_norm_epsilon or initializer_range affect training but aren't
+# worth spending tuner trials on.
+model_defaults:
+  d_model: 256
+  num_layers: 6
+  num_heads: 8
+  dff_multiplier: 4          # dff = d_model * dff_multiplier
+  dropout_rate: 0.1
+  attention_dropout_rate: 0.1
+  activation: "gelu"
+  layer_norm_epsilon: 1.0e-6
+  initializer_range: 0.02
+  tie_embeddings: true
+
+optimizer_defaults:
+  learning_rate: 3.0e-4
+  warmup_steps: 1000
+  min_lr_ratio: 0.1
+  weight_decay: 0.01
+  beta_1: 0.9
+  beta_2: 0.98
+  adam_epsilon: 1.0e-9
+  gradient_clip_norm: 1.0
+  label_smoothing: 0.0
+  batch_size: 64
+  top_k_metrics: [1, 5]
+
+# Keras Tuner search space (hypermodel.py). Each entry names a sampling
+# type ("choice" | "int" | "float" | "boolean") plus the range/options for
+# it; "sampling: log" is used for learning_rate and weight_decay since
+# they span orders of magnitude and matter on a log scale, not a linear
+# one. Anything not listed here (see model_defaults/optimizer_defaults
+# above) is held fixed during the search.
+tuner_search_space:
+  d_model:                { type: choice,  values: [128, 256, 384, 512], default: 256 }
+  num_heads:               { type: choice,  values: [2, 4, 8], default: 4 }
+  num_layers:              { type: int,     min: 2, max: 8, step: 1, default: 4 }
+  dff_multiplier:          { type: choice,  values: [2, 3, 4], default: 4 }
+  dropout_rate:            { type: float,   min: 0.0, max: 0.3, step: 0.05, default: 0.1 }
+  attention_dropout_rate:  { type: float,   min: 0.0, max: 0.3, step: 0.05, default: 0.1 }
+  activation:              { type: choice,  values: ["gelu", "relu"], default: "gelu" }
+  tie_embeddings:          { type: boolean, default: true }
+  learning_rate:           { type: float,   min: 1.0e-5, max: 1.0e-2, sampling: log, default: 3.0e-4 }
+  warmup_steps:            { type: int,     min: 200, max: 4000, step: 200, default: 1000 }
+  weight_decay:            { type: float,   min: 1.0e-6, max: 1.0e-1, sampling: log, default: 0.01 }
+  beta_2:                  { type: choice,  values: [0.95, 0.98, 0.999], default: 0.98 }
+  label_smoothing:         { type: choice,  values: [0.0, 0.05, 0.1], default: 0.0 }
+  gradient_clip_norm:      { type: choice,  values: [0.5, 1.0, 2.0], default: 1.0 }
+  batch_size:              { type: choice,  values: [32, 64, 128], default: 64 }
+
+tuner_run:
+  tuner: "bayesian"           # bayesian | hyperband | random
+  project_name: "chess_transformer"
+  max_trials: 30               # used by bayesian/random
+  epochs_per_trial: 3          # used by bayesian/random
+  max_epochs: 10                # used by hyperband
+  early_stopping_patience: 2
