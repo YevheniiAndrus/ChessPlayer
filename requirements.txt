@@ -1,0 +1,22 @@
+python-chess>=1.10.0
+tqdm>=4.66.0
+keras-tuner[bayesian]>=1.4.0
+pyyaml>=6.0
+
+# TensorFlow itself, split by platform:
+# - On Apple Silicon (macOS arm64), capped below 2.20 because
+#   tensorflow-metal 1.2.0 (its last release, Jan 2025) does not load on
+#   TensorFlow 2.20+ -- see the comment on tensorflow-metal below.
+# - Everywhere else, no upper bound.
+tensorflow>=2.16.0,<2.20 ; sys_platform == "darwin" and platform_machine == "arm64"
+tensorflow>=2.16.0 ; sys_platform != "darwin" or platform_machine != "arm64"
+
+# Apple's GPU acceleration plug-in for TensorFlow on Apple Silicon (uses
+# Metal instead of CUDA). macOS arm64 only -- installing this on Linux/
+# Windows/Intel Mac would fail, hence the platform marker. Pinned exactly
+# to 1.2.0 (the only version compatible with a TensorFlow this recent)
+# rather than left open-ended, since Apple has historically gone ~2 years
+# between tensorflow-metal releases while TensorFlow ships every few
+# months -- an unpinned range here would silently break again the next
+# time TensorFlow updates.
+tensorflow-metal==1.2.0 ; sys_platform == "darwin" and platform_machine == "arm64"
