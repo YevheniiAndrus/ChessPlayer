@@ -29,13 +29,28 @@ like, against whatever checkpoint `train.py` last produced.
 
 ## 1. Requirements
 
-- **macOS on Apple Silicon** (M1/M2/M3), for GPU acceleration via
-  `tensorflow-metal`. The pipeline still runs on other platforms, just on
-  CPU only -- `requirements.txt` is written so the Apple-Silicon-only
-  packages are skipped automatically elsewhere (see below).
-- **Python 3.9** in a virtualenv at the project root (`.venv/`). Newer
-  Python versions may work but haven't been tested against this exact
-  `tensorflow`/`tensorflow-metal` pairing.
+`requirements.txt` uses PEP 508 environment markers to pick the right
+TensorFlow/GPU setup for whatever machine you run it on -- no separate
+requirements file needed per platform:
+
+- **macOS on Apple Silicon** (M1/M2/M3): GPU acceleration via
+  `tensorflow-metal`, with TensorFlow capped below 2.20 (see the
+  comments in `requirements.txt` for why) and **Python 3.9** in a
+  virtualenv at the project root (`.venv/`) -- this specific Python
+  version is a constraint of this pairing (`tensorflow-metal`'s last
+  release, plus `keras-hub`'s last Python-3.9-compatible release), not
+  a project-wide requirement.
+- **Linux with an NVIDIA GPU**: GPU acceleration via the
+  `tensorflow[and-cuda]` extra (pulls in matching CUDA/cuDNN runtime
+  libraries as pip packages -- you still need the NVIDIA driver itself
+  installed at the OS level; `nvidia-smi` should show your GPU before
+  you trust the rest). No Python 3.9 pin here -- use whatever recent
+  Python 3.x your environment provides, and `keras-hub` resolves to its
+  latest release rather than the older pin macOS needs.
+- **Anything else** (Windows native, Intel Mac, no GPU): plain CPU
+  TensorFlow. For GPU on Windows, run under WSL2 instead (it presents
+  as Linux and gets the CUDA branch above) -- native Windows GPU support
+  was dropped after TensorFlow 2.10.
 - A Lichess games database dump (see step 3).
 
 ## 2. Set up the environment
@@ -161,6 +176,28 @@ starting over, since `tune.py` never overwrites a previous run
 right after that trial finishes (this project never reloads a trial's
 trained weights, only the winning hyperparameter *values*), so a long
 search no longer fills up disk the way it originally did.
+
+**A long search can still get killed by the OS running out of RAM**
+(shows up as `zsh: killed`, not a Python error) partway through -- e.g.
+"killed after 17 trials." This isn't a bug in any particular trial:
+TensorFlow (and `tensorflow-metal`) never returns memory to the OS within
+a single process, so a many-trial search's memory footprint is a
+high-water mark that only grows, trial over trial (`hypermodel.py`'s
+`clear_session()`/`gc.collect()` between trials only releases Keras' own
+bookkeeping, not the allocator's already-claimed memory), until whichever
+trial's incremental need finally exceeds available RAM. Resuming (as
+above) is the actual fix, since a fresh process starts with a clean
+memory footprint -- `run_pipeline.sh` does this automatically, restarting
+`tune.py` up to 20 times if it dies. Running `tune.py` directly, wrap it
+the same way:
+
+```bash
+until python scripts/tune.py --tuner bayesian --max-trials 40 \
+    --epochs-per-trial 5 --steps-per-epoch 500 --validation-steps 100; do
+  echo "tune.py died -- resuming from where it left off in 5s..."
+  sleep 5
+done
+```
 
 ### Stage 2: `train.py` -- the real training run
 

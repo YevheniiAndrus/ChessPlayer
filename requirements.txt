@@ -3,13 +3,25 @@ tqdm>=4.66.0
 keras-tuner[bayesian]>=1.4.0
 pyyaml>=6.0
 
-# TensorFlow itself, split by platform:
-# - On Apple Silicon (macOS arm64), capped below 2.20 because
+# TensorFlow itself, split three ways:
+# - Apple Silicon (macOS arm64): capped below 2.20 because
 #   tensorflow-metal 1.2.0 (its last release, Jan 2025) does not load on
 #   TensorFlow 2.20+ -- see the comment on tensorflow-metal below.
-# - Everywhere else, no upper bound.
+# - Linux: the [and-cuda] extra, which is TensorFlow's own current
+#   recommended way to get GPU support -- it pulls the matching
+#   CUDA/cuDNN runtime libraries in as pip packages, so no separate
+#   system CUDA toolkit install is needed. The NVIDIA GPU *driver*
+#   itself still has to be installed at the OS level (pip can't ship a
+#   kernel driver) -- verify it's visible with `nvidia-smi` before
+#   assuming this pulled in a working GPU build. No upper bound, since
+#   the tensorflow-metal ceiling above is Apple-specific.
+# - Everywhere else (Windows, Intel Mac, ...): plain CPU tensorflow, no
+#   upper bound. Native Windows GPU support was dropped after TensorFlow
+#   2.10 -- if you need GPU on Windows, run this inside WSL2 instead,
+#   which presents as sys_platform == "linux" and gets the branch above.
 tensorflow>=2.16.0,<2.20 ; sys_platform == "darwin" and platform_machine == "arm64"
-tensorflow>=2.16.0 ; sys_platform != "darwin" or platform_machine != "arm64"
+tensorflow[and-cuda]>=2.16.0 ; sys_platform == "linux"
+tensorflow>=2.16.0 ; (sys_platform != "darwin" or platform_machine != "arm64") and sys_platform != "linux"
 
 # Apple's GPU acceleration plug-in for TensorFlow on Apple Silicon (uses
 # Metal instead of CUDA). macOS arm64 only -- installing this on Linux/
@@ -20,3 +32,20 @@ tensorflow>=2.16.0 ; sys_platform != "darwin" or platform_machine != "arm64"
 # months -- an unpinned range here would silently break again the next
 # time TensorFlow updates.
 tensorflow-metal==1.2.0 ; sys_platform == "darwin" and platform_machine == "arm64"
+
+# KerasHub, pinned to the LAST release that still supports Python 3.9
+# (this project's venv -- see README). keras-hub 0.22.0 raised its
+# requirement to Python >=3.10, and current releases also pull in
+# tensorflow-text>=2.20.1 as a hard dependency, which forces TensorFlow
+# to 2.20+ -- incompatible with both this project's Python 3.9 venv and
+# tensorflow-metal 1.2.0 above (which doesn't load on TensorFlow 2.20+).
+# An unpinned `pip install keras-hub` grabs that latest release and
+# silently upgrades/breaks both. Don't install the `[nlp]` extra either
+# unless you specifically need its TensorFlow-Text-based tokenizers --
+# this project doesn't, and tensorflow-text has historically had
+# unreliable-to-nonexistent official wheels for macOS arm64.
+keras-hub==0.21.0 ; sys_platform == "darwin" and platform_machine == "arm64"
+# Elsewhere, none of the Apple-Silicon-driven constraints above apply
+# (no forced Python 3.9, no tensorflow-metal ceiling on TensorFlow) --
+# take the latest.
+keras-hub ; sys_platform != "darwin" or platform_machine != "arm64"
