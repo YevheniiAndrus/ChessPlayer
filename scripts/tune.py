@@ -37,6 +37,7 @@ note in build_dataset.py) so no game leaks between the two.
 """
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -80,15 +81,67 @@ class _DeleteCheckpointAfterTrial:
         return result
 
 
-class BayesianOptimization(_DeleteCheckpointAfterTrial, kt.BayesianOptimization):
+class _LogEpochHistory:
+    """Mixin: appends each trial's per-epoch metrics to
+    <trial_dir>/epoch_history.csv, one row per epoch, independent of
+    Keras Tuner's own bookkeeping.
+
+    This exists because Keras Tuner's own trial.json does NOT retain a
+    full epoch-by-epoch history -- checked directly against this
+    project's own tuner_runs/: every completed trial.json holds exactly
+    ONE observation per metric. That's because Tuner.on_epoch_end() is a
+    no-op by default (see keras_tuner's own docstring: "Intermediate
+    results are not passed to the Oracle"); the oracle only ever learns
+    a trial's *final* result, after model.fit() returns, via
+    _build_and_fit_model() -- there is no per-epoch trail left anywhere
+    on disk unless something else records it.
+
+    That's fine for the tuner's own job (ranking trials against each
+    other by a single score) but makes it impossible to tell, after the
+    fact, whether a trial's val_loss fell smoothly and stayed down, or
+    dipped early and then flattened/worsened before its trial ended --
+    exactly the distinction that matters for judging whether a
+    learning rate is actually stable versus just transiently good (see
+    the comment on tuner_search_space.learning_rate in config.yaml).
+    Tuner.on_epoch_end(trial, model, epoch, logs) is the real hook Keras
+    Tuner already calls once per epoch via TunerCallback -- it just
+    normally throws the result away. Overriding it here to also persist
+    `logs` (the epoch's train+val metrics dict Keras itself produces)
+    is what scripts/plot_tuner_trials.py reads to reconstruct real
+    per-epoch trajectories for the top trials of a completed search.
+
+    Only trials run AFTER this mixin was added will have an
+    epoch_history.csv -- older completed trials (like the ones from
+    before this change) only have the single collapsed value trial.json
+    always had, and plot_tuner_trials.py reports that plainly rather
+    than pretending to have data it doesn't.
+    """
+
+    def on_epoch_end(self, trial, model, epoch, logs=None):
+        result = super().on_epoch_end(trial, model, epoch, logs=logs)
+        logs = logs or {}
+        trial_dir = Path(self.get_trial_dir(trial.trial_id))
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        history_path = trial_dir / "epoch_history.csv"
+        row = {"epoch": epoch, **logs}
+        write_header = not history_path.exists()
+        with history_path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        return result
+
+
+class BayesianOptimization(_LogEpochHistory, _DeleteCheckpointAfterTrial, kt.BayesianOptimization):
     pass
 
 
-class Hyperband(_DeleteCheckpointAfterTrial, kt.Hyperband):
+class Hyperband(_LogEpochHistory, _DeleteCheckpointAfterTrial, kt.Hyperband):
     pass
 
 
-class RandomSearch(_DeleteCheckpointAfterTrial, kt.RandomSearch):
+class RandomSearch(_LogEpochHistory, _DeleteCheckpointAfterTrial, kt.RandomSearch):
     pass
 
 

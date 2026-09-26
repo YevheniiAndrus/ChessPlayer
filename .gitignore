@@ -2,3 +2,4 @@ data/
 .venv/
 .DS_Store
 tuner_runs/
+scripts/__pycache__/

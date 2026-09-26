@@ -28,6 +28,149 @@ from config import load_config
 from model import ChessTransformerDecoder, LinearWarmup
 
 
+class TrainingLossSafetyNet(tf.keras.callbacks.Callback):
+    """Cuts learning_rate mid-epoch on a sustained rise in smoothed
+    TRAINING loss, instead of waiting for ReduceLROnPlateau's val_loss
+    check at epoch end.
+
+    Why this needs its own smoothing rather than reading Keras's
+    logs['loss'] directly: that value is a stateful running MEAN over
+    every batch since the epoch started, reset only at on_epoch_begin.
+    On a short epoch that's fine, but on an epoch like this project's
+    (~95,000 steps), by batch 50,000 that running mean is already an
+    average over 50,000 batches -- if the last few hundred of those
+    batches blew up, the epoch-long average barely moves, and neither
+    the live progress bar nor a callback reading logs['loss'] naively
+    would show anything wrong until enormous compute had already been
+    spent training a model that was diverging the whole time. So this
+    callback first UNDOES that running mean algebraically (raw_loss_n =
+    n*mean_n - (n-1)*mean_{n-1}) to recover the actual per-batch loss,
+    then re-smooths that with its own short EMA (same bias-corrected
+    scheme as find_lr.py's LRRangeTest) so the signal reacts on a
+    timescale of tens of batches, not tens of thousands. The arithmetic
+    is done in Python float (float64) rather than left as TF's float32,
+    since n*mean_n can reach ~1e6 by the end of a long epoch and
+    subtracting two such close, large float32 values would lose most of
+    the precision needed to see a small genuine change.
+
+    Training perplexity isn't tracked separately -- perplexity is
+    exp(loss), a monotonic function of it, so "smoothed training loss
+    rising" and "smoothed training perplexity rising" are the same
+    event; watching loss covers both.
+
+    A rise is only acted on once it's SUSTAINED (--intra-epoch-patience-
+    checks consecutive batches above threshold), not on any single
+    worsening step -- per-batch loss is naturally noisy (different
+    batches contain harder or easier positions to predict) even during
+    perfectly healthy training, so reacting to every uptick would cut
+    learning_rate constantly rather than only when it's actually too
+    aggressive. A cooldown after each cut then gives that cut time to
+    show its effect before another can fire.
+
+    A grace period (warmup_steps, passed in by train.py) skips judgement
+    entirely while LinearWarmup is still ramping learning_rate up --
+    loss can wobble in ways that aren't about learning_rate being wrong
+    while the model is still very early in training and LR itself is a
+    moving target.
+
+    Only usable with a plain, settable-float learning_rate (i.e.
+    --lr-schedule plateau, total_steps=None) -- same constraint as
+    LinearWarmup and ReduceLROnPlateau elsewhere in this project.
+    """
+
+    def __init__(self, factor=0.5, min_lr=0.0, smoothing=0.98, threshold=0.03,
+                 patience_checks=50, cooldown_steps=1000, warmup_grace_steps=0, verbose=1):
+        super().__init__()
+        self.factor = factor
+        self.min_lr = min_lr
+        self.smoothing = smoothing
+        self.threshold = threshold
+        self.patience_checks = patience_checks
+        self.cooldown_steps = cooldown_steps
+        self.warmup_grace_steps = warmup_grace_steps
+        self.verbose = verbose
+
+        self._global_step = 0
+        self._best_smoothed = float("inf")
+        self._bad_checks = 0
+        self._last_cut_step = None
+        self._reset_epoch_state()
+
+    def _reset_epoch_state(self):
+        # Keras's logs['loss'] running mean resets every epoch, so our
+        # reconstruction of it has to reset in step with it.
+        self._prev_cumulative_loss = None
+        self._prev_n = 0
+        self._avg_loss = None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._reset_epoch_state()
+
+    def on_train_batch_end(self, batch, logs=None):
+        self._global_step += 1
+        logs = logs or {}
+        cumulative_loss = logs.get("loss")
+        if cumulative_loss is None:
+            return
+        cumulative_loss = float(cumulative_loss)  # force float64 math -- see class docstring
+        n = batch + 1  # Keras's batch index is 0-based within the epoch
+
+        if self._prev_cumulative_loss is None:
+            raw_loss = cumulative_loss  # first batch of the epoch: mean_1 == loss_1, nothing to undo
+        else:
+            raw_loss = n * cumulative_loss - self._prev_n * self._prev_cumulative_loss
+        self._prev_cumulative_loss = cumulative_loss
+        self._prev_n = n
+
+        if self._avg_loss is None:
+            self._avg_loss = (1 - self.smoothing) * raw_loss
+        else:
+            self._avg_loss = self.smoothing * self._avg_loss + (1 - self.smoothing) * raw_loss
+        # Bias-corrected the same way find_lr.py's LRRangeTest is, using
+        # the in-epoch batch index n (since _avg_loss also resets every
+        # epoch) so a freshly-reset epoch doesn't take dozens of steps
+        # before the smoothed value means anything.
+        smoothed = self._avg_loss / (1 - self.smoothing ** n)
+
+        if self._global_step <= self.warmup_grace_steps:
+            self._best_smoothed = min(self._best_smoothed, smoothed)
+            return
+
+        if smoothed <= self._best_smoothed:
+            self._best_smoothed = smoothed
+            self._bad_checks = 0
+            return
+
+        if smoothed > self._best_smoothed * (1 + self.threshold):
+            self._bad_checks += 1
+        else:
+            self._bad_checks = 0  # above best, but within noise band -- not sustained yet
+
+        if self._bad_checks < self.patience_checks:
+            return
+
+        if self._last_cut_step is not None and self._global_step - self._last_cut_step < self.cooldown_steps:
+            return
+
+        old_lr = float(self.model.optimizer.learning_rate)
+        new_lr = max(old_lr * self.factor, self.min_lr)
+        if new_lr < old_lr:
+            self.model.optimizer.learning_rate = new_lr
+            if self.verbose:
+                pct = (smoothed / self._best_smoothed - 1) * 100
+                print(
+                    f"\n[TrainingLossSafetyNet] step {self._global_step}: smoothed training loss "
+                    f"{smoothed:.4f} is {pct:.1f}% above its best-seen value ({self._best_smoothed:.4f}) "
+                    f"for {self._bad_checks} consecutive batches -- cutting learning_rate "
+                    f"{old_lr:.6g} -> {new_lr:.6g}."
+                )
+        # Re-baseline regardless of whether the floor was already hit, so
+        # a stuck-at-floor run doesn't spam checks every single batch.
+        self._best_smoothed = smoothed
+        self._bad_checks = 0
+        self._last_cut_step = self._global_step
+
+
 def parse_args(cfg):
     tuner_run = cfg["tuner_run"]
     default_best_hp_path = Path(cfg["paths"]["tuner_project_dir"]) / f"{tuner_run['project_name']}_best_hyperparameters.json"
@@ -85,6 +228,41 @@ def parse_args(cfg):
     parser.add_argument(
         "--min-lr", type=float, default=None,
         help="plateau mode only: floor for learning_rate reduction. Defaults to learning_rate * min_lr_ratio (same floor the cosine schedule would have used).",
+    )
+    parser.add_argument(
+        "--intra-epoch-safety", action="store_true",
+        help=(
+            "plateau mode only. A second, faster safety net on top of "
+            "ReduceLROnPlateau: ReduceLROnPlateau only ever looks at "
+            "val_loss at epoch end, so on a run where one epoch takes "
+            "hours, a too-aggressive learning_rate can burn most of an "
+            "epoch (or several, during ReduceLROnPlateau's own patience "
+            "window) before anything reacts. This watches smoothed "
+            "TRAINING loss every batch instead and halves learning_rate "
+            "immediately on a sustained rise -- see TrainingLossSafetyNet "
+            "below for why this needs its own smoothing rather than just "
+            "reading Keras's own per-batch logs['loss'] directly."
+        ),
+    )
+    parser.add_argument(
+        "--intra-epoch-smoothing", type=float, default=0.98,
+        help="EMA smoothing factor for the intra-epoch loss trend (same idea as find_lr.py's LRRangeTest). Default: 0.98.",
+    )
+    parser.add_argument(
+        "--intra-epoch-threshold", type=float, default=0.03,
+        help="Cut learning_rate when smoothed training loss exceeds its best-seen value (since the last cut) by this fraction. Default: 0.03 (3%%).",
+    )
+    parser.add_argument(
+        "--intra-epoch-patience-checks", type=int, default=50,
+        help="Consecutive worsening batches required before cutting -- filters ordinary batch-to-batch noise. Default: 50.",
+    )
+    parser.add_argument(
+        "--intra-epoch-cooldown-steps", type=int, default=1000,
+        help="Minimum batches between two intra-epoch cuts, so one cut has time to take effect before another can fire. Default: 1000.",
+    )
+    parser.add_argument(
+        "--intra-epoch-factor", type=float, default=0.5,
+        help="Multiply learning_rate by this on an intra-epoch cut. Default: 0.5 (same as --reduce-lr-factor).",
     )
     parser.add_argument(
         "--resume-from", type=Path, default=None,
@@ -267,6 +445,30 @@ def main():
             f"{model_params['warmup_steps']} steps, then hold; ReduceLROnPlateau will cut LR by "
             f"{args.reduce_lr_factor}x after {args.reduce_lr_patience} epoch(s) with no val_loss "
             f"improvement, down to a floor of {min_lr}."
+        )
+        if args.intra_epoch_safety:
+            callbacks.append(
+                TrainingLossSafetyNet(
+                    factor=args.intra_epoch_factor, min_lr=min_lr,
+                    smoothing=args.intra_epoch_smoothing, threshold=args.intra_epoch_threshold,
+                    patience_checks=args.intra_epoch_patience_checks,
+                    cooldown_steps=args.intra_epoch_cooldown_steps,
+                    warmup_grace_steps=model_params["warmup_steps"],
+                )
+            )
+            print(
+                f"Intra-epoch safety net: ON -- watching smoothed training loss every batch "
+                f"(after the first {model_params['warmup_steps']} warmup steps), cutting LR by "
+                f"{args.intra_epoch_factor}x on a sustained rise of {args.intra_epoch_threshold * 100:.0f}% "
+                f"above its best-seen value for {args.intra_epoch_patience_checks} consecutive batches, "
+                f"same floor of {min_lr}."
+            )
+    elif args.intra_epoch_safety:
+        print(
+            "\n--intra-epoch-safety was set but --lr-schedule is 'cosine' -- ignoring it. "
+            "The cosine schedule bakes learning_rate into a non-settable LearningRateSchedule "
+            "object (see model.py's WarmupCosineDecay), so it can't be adjusted on the fly the "
+            "way LinearWarmup/ReduceLROnPlateau/this safety net all require total_steps=None for."
         )
 
     model.fit(

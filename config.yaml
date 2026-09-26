@@ -77,8 +77,36 @@ tuner_search_space:
   attention_dropout_rate:  { type: float,   min: 0.0, max: 0.3, step: 0.05, default: 0.1 }
   activation:              { type: choice,  values: ["gelu", "relu"], default: "gelu" }
   tie_embeddings:          { type: boolean, default: true }
-  learning_rate:           { type: float,   min: 1.0e-5, max: 1.0e-2, sampling: log, default: 3.0e-4 }
-  warmup_steps:            { type: int,     min: 200, max: 4000, step: 200, default: 1000 }
+  # learning_rate's max was 1.0e-2 -- lowered to 3.0e-3 after two separate
+  # searches both picked a value within ~4% of that old ceiling (0.0065,
+  # then 0.0096), both of which looked great for a couple of epochs and
+  # then destabilized. Keras Tuner scores a trial by the BEST value its
+  # objective (val_loss) ever reaches during that trial, not its final or
+  # sustained value -- so a too-high LR that dips low early before
+  # diverging scores identically to one that reaches the same low point
+  # and stays there. Longer trials don't fix this (more epochs just gives
+  # an unstable trial more chances to hit a good-looking dip); keeping
+  # this ceiling low enough that the region never gets sampled is the
+  # only real fix.
+  #
+  # scripts/find_lr.py corroborates this cap rather than replacing it.
+  # A range test (single monotonic LR ramp over one short run) found the
+  # steepest-descent region spans roughly 2e-3 to 2e-1, with its single
+  # suggested peak at 9.22e-3 -- almost exactly the old 0.0096 that broke
+  # sustained training. That's not a contradiction: the range test only
+  # measures whether one gradient step at a given LR is still productive
+  # in the moment (real divergence there doesn't start until ~0.3-0.4),
+  # it says nothing about whether that LR stays stable over thousands of
+  # sustained steps with warmup/decay and accumulated optimizer state,
+  # which is the failure mode that actually bit us. So the ceiling stays
+  # at 3.0e-3 -- comfortably inside the range test's productive region,
+  # well clear of the value with a real history of blowing up.
+  learning_rate:           { type: float,   min: 1.0e-5, max: 3.0e-3, sampling: log, default: 3.0e-4 }
+  # Capped to match steps-per-epoch guidance in the README/run_pipeline.sh
+  # (recommend --steps-per-epoch >= this max) so every trial's first
+  # measured epoch actually finishes warmup and spends real time at peak
+  # LR, rather than still ramping when that epoch's metrics get logged.
+  warmup_steps:            { type: int,     min: 200, max: 2000, step: 200, default: 1000 }
   weight_decay:            { type: float,   min: 1.0e-6, max: 1.0e-1, sampling: log, default: 0.01 }
   beta_2:                  { type: choice,  values: [0.95, 0.98, 0.999], default: 0.98 }
   label_smoothing:         { type: choice,  values: [0.0, 0.05, 0.1], default: 0.0 }

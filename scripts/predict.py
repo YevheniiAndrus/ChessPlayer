@@ -25,6 +25,15 @@ Usage:
     python scripts/predict.py --moves "e4 e5 Nf3 Nc6" --top-k 10
     python scripts/predict.py --moves "e4 e5 Nf3 Nc6" --allow-illegal
 
+    # Interactive mode: one process stays running, predicts, waits for you
+    # to type the move actually played, appends it, and predicts again --
+    # instead of re-running the script (and reloading the model) per move.
+    # --moves/--pgn become optional starting context instead of the whole
+    # game. See make_predict_fn()'s docstring for why this is also the mode
+    # that benefits from a compiled prediction function.
+    python scripts/predict.py --interactive
+    python scripts/predict.py --interactive --moves "e4 e5 Nf3 Nc6"
+
 How the prediction is made
 ----------------------------
 Moves are parsed against a real chess.Board() (so SAN is disambiguated,
@@ -87,7 +96,7 @@ def parse_args(cfg):
         description="Predict the next chess move from a sequence of previous moves.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    moves_group = parser.add_mutually_exclusive_group(required=True)
+    moves_group = parser.add_mutually_exclusive_group(required=False)
     moves_group.add_argument(
         "--moves",
         help="The moves played so far, as one space-separated string (SAN and/or UCI, "
@@ -119,7 +128,19 @@ def parse_args(cfg):
              "preference over the whole vocabulary instead. For inspecting the model, not "
              "for actually picking a move to play.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--interactive", action="store_true",
+        help=(
+            "Run as a persistent loop instead of a single one-shot prediction: predicts, "
+            "waits for you to type the move that was actually played, appends it, and "
+            "predicts again -- repeatedly, in the same process. --moves/--pgn become "
+            "optional starting context instead of the whole game."
+        ),
+    )
+    args = parser.parse_args()
+    if not args.interactive and args.moves is None and args.pgn is None:
+        parser.error("one of --moves or --pgn is required unless --interactive is set")
+    return args
 
 
 def clean_move_tokens(text):
@@ -210,9 +231,40 @@ def build_input_window(ids, seq_len, pad_id):
     return recent, next_move_position
 
 
-def predict_next_move(model, input_ids, next_move_position, board, id_to_move, top_k, allow_illegal):
-    input_tensor = tf.constant([input_ids], dtype=tf.int32)  # shape (1, seq_len)
-    logits = model(input_tensor, training=False)[0, next_move_position, :].numpy()  # (vocab_size,)
+def make_predict_fn(model):
+    """Wrap the model's forward pass in a tf.function so repeated calls
+    with the same input shape only pay tracing/graph-compilation cost
+    ONCE, then reuse the compiled graph on every later call instead of
+    running eagerly (unoptimized, op-by-op) every time.
+
+    This only pays off because build_input_window() always hands back a
+    FIXED shape -- exactly (1, seq_len), padded or truncated as needed --
+    no matter how long the actual game gets. That's different from naive
+    autoregressive text generation, where the sequence grows by one token
+    every step and would trigger a retrace on every single call, erasing
+    the benefit (and, worse, spending MORE time retracing than eager
+    execution would have taken). Because this project always predicts one
+    fixed-length window at a time rather than growing the input, --interactive
+    mode gets the full benefit: the first call traces, every call after
+    that in the same session runs the already-compiled graph.
+
+    Deliberately not model.predict(): that also compiles under the hood
+    and would give the same one-time-tracing benefit here, but it also
+    re-enters Keras's data-adapter/Dataset-wrapping and callback machinery
+    on every single call -- overhead built for iterating many batches,
+    paid again each time for what's always a single (1, seq_len) example
+    here. A directly tf.function-wrapped call skips straight from "already
+    traced" to "run the compiled graph", with none of that per-call cost.
+    """
+    @tf.function
+    def predict_fn(input_tensor):
+        return model(input_tensor, training=False)
+    return predict_fn
+
+
+def predict_next_move(predict_fn, input_ids, next_move_position, board, id_to_move, top_k, allow_illegal):
+    input_tensor = tf.constant([input_ids], dtype=tf.int32)  # shape (1, seq_len) -- always the same, see make_predict_fn
+    logits = predict_fn(input_tensor)[0, next_move_position, :].numpy()  # (vocab_size,)
 
     if not allow_illegal:
         legal_uci = {move.uci() for move in board.legal_moves}
@@ -236,6 +288,79 @@ def predict_next_move(model, input_ids, next_move_position, board, id_to_move, t
             san = None  # --allow-illegal can surface a move that isn't legal right now
         candidates.append({"uci": uci, "san": san, "probability": float(probs[idx])})
     return candidates
+
+
+def print_prediction(candidates, top_k):
+    if candidates is None:
+        return
+    best = candidates[0]
+    best_label = f"{best['san']} ({best['uci']})" if best["san"] else best["uci"]
+    print(f"Predicted move: {best_label}  [{best['probability']:.1%}]")
+    if len(candidates) > 1:
+        print(f"Top {len(candidates)} candidates:")
+        for rank, c in enumerate(candidates, start=1):
+            label = f"{c['san']} ({c['uci']})" if c["san"] else c["uci"]
+            print(f"  {rank}. {label:<18} {c['probability']:.1%}")
+
+
+def run_interactive(predict_fn, ids, board, move_to_id, id_to_move, pad_id, seq_len, top_k, allow_illegal):
+    """Persistent loop: predict, wait for the move actually played, append
+    it, predict again. One process, one model load, one trace of
+    predict_fn -- see make_predict_fn()'s docstring for why every
+    prediction after the first reuses that same compiled graph."""
+    print("\nInteractive mode -- enter each move as it's played (SAN or UCI), or 'quit' to exit.")
+    while True:
+        if board.is_game_over():
+            if board.is_checkmate():
+                result = "Checkmate"
+            elif board.is_stalemate():
+                result = "Stalemate"
+            else:
+                result = "Game over"
+            print(f"\n{result} ({board.result()}) -- nothing left to predict.")
+            return
+
+        side_to_move = "White" if board.turn == chess.WHITE else "Black"
+        print(f"\nPosition after {len(ids)} move(s) -- {side_to_move} to play (move {board.fullmove_number}).")
+        if board.is_check():
+            print("(in check)")
+
+        input_ids, next_move_position = build_input_window(ids, seq_len, pad_id)
+        candidates = predict_next_move(predict_fn, input_ids, next_move_position, board, id_to_move, top_k, allow_illegal)
+        print_prediction(candidates, top_k)
+
+        try:
+            token = input("\nEnter the move actually played (or 'quit'): ").strip()
+        except EOFError:
+            print()
+            return
+        if token.lower() in ("quit", "exit", "q"):
+            return
+        if not token:
+            continue
+
+        move = None
+        try:
+            move = board.parse_san(token)
+        except ValueError:
+            try:
+                move = board.parse_uci(token)
+            except ValueError:
+                pass
+        if move is None:
+            print(f"'{token}' isn't a legal SAN or UCI move in this position -- try again.")
+            continue
+
+        uci = move.uci()
+        move_id = move_to_id.get(uci)
+        if move_id is None:
+            # Same defensive case as replay_moves() -- shouldn't happen given
+            # how build_vocab.py enumerates the vocabulary.
+            print(f"'{token}' -> {uci} has no vocabulary entry (unexpected) -- try again.")
+            continue
+
+        ids.append(move_id)
+        board.push(move)
 
 
 def main():
@@ -262,15 +387,26 @@ def main():
     model(tf.zeros((1, args.seq_len), dtype=tf.int32))  # build every sub-layer via a real forward pass
     model.load_weights(str(args.checkpoint))
 
+    predict_fn = make_predict_fn(model)
+    predict_fn(tf.zeros((1, args.seq_len), dtype=tf.int32))  # trace once, up front, rather than on the first real move
+
     if args.pgn is not None:
         move_tokens = moves_from_pgn(args.pgn)
-    else:
+    elif args.moves is not None:
         move_tokens = clean_move_tokens(args.moves)
-    if not move_tokens:
+    else:
+        move_tokens = []  # --interactive with no starting context -- fresh board
+
+    if not move_tokens and not args.interactive:
         print("No moves given.", file=sys.stderr)
         sys.exit(1)
 
-    ids, board = replay_moves(move_tokens, move_to_id)
+    ids, board = replay_moves(move_tokens, move_to_id) if move_tokens else ([], chess.Board())
+
+    if args.interactive:
+        run_interactive(predict_fn, ids, board, move_to_id, id_to_move, pad_id, args.seq_len, args.top_k, args.allow_illegal)
+        return
+
     input_ids, next_move_position = build_input_window(ids, args.seq_len, pad_id)
 
     side_to_move = "White" if board.turn == chess.WHITE else "Black"
@@ -280,7 +416,7 @@ def main():
         print("(in check)")
 
     candidates = predict_next_move(
-        model, input_ids, next_move_position, board, id_to_move, args.top_k, args.allow_illegal
+        predict_fn, input_ids, next_move_position, board, id_to_move, args.top_k, args.allow_illegal
     )
 
     if candidates is None:
@@ -292,15 +428,8 @@ def main():
         print("\nNo legal moves found in the model's vocabulary (unexpected) -- try --allow-illegal to inspect raw output.")
         return
 
-    best = candidates[0]
-    best_label = f"{best['san']} ({best['uci']})" if best["san"] else best["uci"]
-    print(f"\nPredicted move: {best_label}  [{best['probability']:.1%}]")
-
-    if len(candidates) > 1:
-        print(f"\nTop {len(candidates)} candidates:")
-        for rank, c in enumerate(candidates, start=1):
-            label = f"{c['san']} ({c['uci']})" if c["san"] else c["uci"]
-            print(f"  {rank}. {label:<18} {c['probability']:.1%}")
+    print()
+    print_prediction(candidates, args.top_k)
 
 
 if __name__ == "__main__":
